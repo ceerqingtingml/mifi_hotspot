@@ -86,6 +86,13 @@ CONFIG_ESP_GSP_ANIM_FRAME_MEMORY_AUTO=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=24
+# SoftAP and ESP-NOW share one pool of encryption keys. This product does not
+# use ESP-NOW; reserving the default 7 keys leaves later stations associated
+# but unable to pass traffic. 0 keeps the full key pool for the hotspot.
+CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=0
+CONFIG_WIFI_RMT_ESPNOW_MAX_ENCRYPT_NUM=0
+# DHCP must hand out an address to every allowed station, not just the first.
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=16
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
 CONFIG_ESP_TASK_WDT_INIT=n

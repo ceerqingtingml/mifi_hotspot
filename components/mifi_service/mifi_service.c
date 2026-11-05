@@ -11,6 +11,8 @@
 #include "bsp/power.h"
 #include "dhcpserver/dhcpserver.h"
 #include "dhcpserver/dhcpserver_options.h"
+#include "lwip/def.h"
+#include "lwip/ip4_addr.h"
 #include "driver/temperature_sensor.h"
 #include "esp_check.h"
 #include "esp_event.h"
@@ -141,8 +143,12 @@ static wifi_auth_mode_t map_wifi_auth(uint8_t ui_auth)
     case 3:
         return WIFI_AUTH_WPA_WPA2_PSK;
     case 4:
+        /* WPA2/WPA3 transition only completes a data key for the first
+         * station on this SoftAP. Run WPA2-PSK so every station can pass
+         * traffic. WPA3-only remains available as mode 2. */
+        return WIFI_AUTH_WPA2_PSK;
     default:
-        return WIFI_AUTH_WPA2_WPA3_PSK;
+        return WIFI_AUTH_WPA2_PSK;
     }
 }
 
@@ -178,7 +184,7 @@ static void default_settings(app_mifi_settings_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->ssid, sizeof(cfg->ssid), "Mosaico_4G");
     snprintf(cfg->password, sizeof(cfg->password), "mifi2026");
-    cfg->auth_mode = 4;      /* WPA2/WPA3-Personal */
+    cfg->auth_mode = 1;      /* WPA2-Personal: mixed WPA3 only serves the first station */
     cfg->channel_mode = 6;   /* Channel 6 */
     cfg->actual_channel = 6;
     cfg->max_conn_mode = 1;  /* 8 stations */
@@ -223,6 +229,9 @@ static void load_settings_from_nvs(app_mifi_settings_t *cfg)
     if (nvs_get_blob(nvs, "settings_v2", cfg, &len) != ESP_OK ||
         len != sizeof(*cfg)) {
         default_settings(cfg);
+    }
+    if (cfg->auth_mode == 4) {
+        cfg->auth_mode = 1;
     }
     uint64_t saved_bytes = 0;
     if (nvs_get_u64(nvs, "wan_bytes_v2", &saved_bytes) == ESP_OK) {
@@ -344,9 +353,20 @@ static void apply_softap_config(const app_mifi_settings_t *cfg,
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
     } else {
+        wifi_config_t applied = {0};
+        uint8_t effective_max = wifi_cfg.ap.max_connection;
+        if (esp_wifi_get_config(WIFI_IF_AP, &applied) == ESP_OK) {
+            effective_max = applied.ap.max_connection;
+        }
         ESP_LOGI(TAG, "SoftAP updated: SSID=%s ch=%u auth=%d max_conn=%u",
                  cfg->ssid, (unsigned)channel, (int)wifi_cfg.ap.authmode,
-                 (unsigned)wifi_cfg.ap.max_connection);
+                 (unsigned)effective_max);
+        if (effective_max < wifi_cfg.ap.max_connection) {
+            ESP_LOGW(TAG, "SoftAP max_connection clamped %u -> %u "
+                     "(encryption keys shared with ESP-NOW)",
+                     (unsigned)wifi_cfg.ap.max_connection,
+                     (unsigned)effective_max);
+        }
     }
 
     esp_wifi_set_ps(cfg->power_save ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
@@ -354,7 +374,30 @@ static void apply_softap_config(const app_mifi_settings_t *cfg,
     if (cfg->all_paused) {
         esp_netif_napt_disable(s_svc.ap_netif);
     } else {
-        esp_netif_napt_enable(s_svc.ap_netif);
+        esp_err_t napt_err = esp_netif_napt_enable(s_svc.ap_netif);
+        if (napt_err != ESP_OK) {
+            ESP_LOGW(TAG, "NAPT enable failed: %s", esp_err_to_name(napt_err));
+        }
+    }
+
+}
+
+static uint32_t s_softap_dns_main;
+static uint32_t s_softap_dns_backup;
+
+static void configure_ap_dhcp_pool(esp_netif_t *ap_netif)
+{
+    dhcps_lease_t lease = {
+        .enable = true,
+    };
+    /* 192.168.4.1 is the SoftAP itself. .2-.17 is one lease per station. */
+    IP4_ADDR(&lease.start_ip, 192, 168, 4, 2);
+    IP4_ADDR(&lease.end_ip, 192, 168, 4, 17);
+    esp_err_t err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                           ESP_NETIF_REQUESTED_IP_ADDRESS,
+                                           &lease, sizeof(lease));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DHCP pool set failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -364,17 +407,38 @@ static void forward_dns_to_softap(esp_netif_t *ap_netif, esp_netif_t *wan_netif)
         return;
     }
     esp_netif_dns_info_t dns = {0};
-    if (esp_netif_get_dns_info(wan_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
-        dns.ip.u_addr.ip4.addr != 0) {
-        uint8_t offer = DHCPS_OFFER_DNS;
-        esp_netif_dhcps_stop(ap_netif);
-        esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
-                               ESP_NETIF_DOMAIN_NAME_SERVER, &offer, sizeof(offer));
-        esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-        esp_netif_dhcps_start(ap_netif);
-        ESP_LOGI(TAG, "Forwarded WAN DNS " IPSTR " to SoftAP DHCP",
-                 IP2STR(&dns.ip.u_addr.ip4));
+    if (esp_netif_get_dns_info(wan_netif, ESP_NETIF_DNS_MAIN, &dns) != ESP_OK ||
+        dns.ip.u_addr.ip4.addr == 0) {
+        return;
     }
+    /* Public resolver, so a station still has DNS if the modem resolver
+     * only answers the first client. Restarting DHCP wipes every lease,
+     * which leaves later phones associated with no address. */
+    const uint32_t backup_addr = PP_HTONL(LWIP_MAKEU32(223, 5, 5, 5));
+    if (s_softap_dns_main == dns.ip.u_addr.ip4.addr &&
+        s_softap_dns_backup == backup_addr) {
+        return;
+    }
+    esp_netif_dns_info_t backup = {0};
+    backup.ip.type = ESP_IPADDR_TYPE_V4;
+    backup.ip.u_addr.ip4.addr = backup_addr;
+
+    uint8_t offer = DHCPS_OFFER_DNS;
+    esp_netif_dhcps_stop(ap_netif);
+    configure_ap_dhcp_pool(ap_netif);
+    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_DOMAIN_NAME_SERVER, &offer, sizeof(offer));
+    esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+    esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_BACKUP, &backup);
+    esp_err_t err = esp_netif_dhcps_start(ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "SoftAP DHCP restart failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_softap_dns_main = dns.ip.u_addr.ip4.addr;
+    s_softap_dns_backup = backup_addr;
+    ESP_LOGI(TAG, "Forwarded WAN DNS " IPSTR " + backup 223.5.5.5 to SoftAP DHCP",
+             IP2STR(&dns.ip.u_addr.ip4));
 }
 
 static void push_log_event_locked(const char *zh, const char *en)
@@ -862,7 +926,11 @@ static void wifi_and_net_event_handler(void *arg, esp_event_base_t base,
         esp_netif_set_default_netif(s_svc.rndis_netif);
         forward_dns_to_softap(s_svc.ap_netif, s_svc.rndis_netif);
         if (s_svc.ap_netif && !s_svc.settings.all_paused) {
-            esp_netif_napt_enable(s_svc.ap_netif);
+            esp_err_t napt_err = esp_netif_napt_enable(s_svc.ap_netif);
+            if (napt_err != ESP_OK) {
+                ESP_LOGW(TAG, "NAPT enable on WAN-up failed: %s",
+                         esp_err_to_name(napt_err));
+            }
         }
     }
 }
