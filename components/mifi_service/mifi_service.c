@@ -143,10 +143,7 @@ static wifi_auth_mode_t map_wifi_auth(uint8_t ui_auth)
     case 3:
         return WIFI_AUTH_WPA_WPA2_PSK;
     case 4:
-        /* WPA2/WPA3 transition only completes a data key for the first
-         * station on this SoftAP. Run WPA2-PSK so every station can pass
-         * traffic. WPA3-only remains available as mode 2. */
-        return WIFI_AUTH_WPA2_PSK;
+        return WIFI_AUTH_WPA2_WPA3_PSK;
     default:
         return WIFI_AUTH_WPA2_PSK;
     }
@@ -184,7 +181,7 @@ static void default_settings(app_mifi_settings_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->ssid, sizeof(cfg->ssid), "Mosaico_4G");
     snprintf(cfg->password, sizeof(cfg->password), "mifi2026");
-    cfg->auth_mode = 1;      /* WPA2-Personal: mixed WPA3 only serves the first station */
+    cfg->auth_mode = 4;      /* WPA2/WPA3-Personal */
     cfg->channel_mode = 6;   /* Channel 6 */
     cfg->actual_channel = 6;
     cfg->max_conn_mode = 1;  /* 8 stations */
@@ -229,9 +226,6 @@ static void load_settings_from_nvs(app_mifi_settings_t *cfg)
     if (nvs_get_blob(nvs, "settings_v2", cfg, &len) != ESP_OK ||
         len != sizeof(*cfg)) {
         default_settings(cfg);
-    }
-    if (cfg->auth_mode == 4) {
-        cfg->auth_mode = 1;
     }
     uint64_t saved_bytes = 0;
     if (nvs_get_u64(nvs, "wan_bytes_v2", &saved_bytes) == ESP_OK) {

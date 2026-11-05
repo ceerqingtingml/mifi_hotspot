@@ -24,11 +24,10 @@
 
 /* Soft-AP modes ESP32-S31 accepts, in dropdown order:
  * OPEN, WPA2_PSK, WPA3_PSK, WPA_WPA2_PSK, WPA2_WPA3_PSK.
- * Default is WPA2-PSK. WPA2/WPA3 transition only gives the first
- * station a usable data key.
+ * The on-screen choice is applied as-is.
  */
 #define AUTH_MODE_COUNT 5
-#define AUTH_MODE_DEFAULT 1
+#define AUTH_MODE_DEFAULT 4
 #define BRIGHTNESS_MIN 10
 #define BRIGHTNESS_MAX 100
 #define BRIGHTNESS_DEFAULT 70
