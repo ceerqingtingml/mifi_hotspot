@@ -437,7 +437,7 @@ static void refresh_device_detail(struct app_mifi *state)
         }
         const app_mifi_station_info_t *info = &state->telemetry.stations[idx];
         const char *name = info->name[0] ? info->name
-                                         : tr(state, "接入设备", "Client");
+                                         : tr(state, "未知设备", "Unknown");
         snprintf(meta, sizeof(meta), "MAC  %s  ·  %s", info->mac, info->ip);
         if (state->english) {
             snprintf(online, sizeof(online), "Online %s  ·  Used %s",
@@ -976,7 +976,7 @@ static gsp_err_t bind_station(esp_gsp_handle_t ui, esp_gsp_row_t row,
             return ESP_GSP_ERR_INVALID_ARG;
         }
         const app_mifi_station_info_t *info = &state->telemetry.stations[item];
-        name_text = info->name[0] ? info->name : tr(state, "接入设备", "Client");
+        name_text = info->name[0] ? info->name : tr(state, "未知设备", "Unknown");
         mac_raw = info->mac;
         ip_raw = info->ip;
         usage_raw = info->usage;
@@ -1022,20 +1022,20 @@ static gsp_err_t bind_station(esp_gsp_handle_t ui, esp_gsp_row_t row,
         err = gsp_mifi_device_row_row_set_device_status_fg_color(ui, row, accent);
     }
     if (err == ESP_GSP_OK) {
-        const uint8_t *icon = icon_phone_png;
-        size_t icon_size = sizeof(icon_phone_png);
+        const uint8_t *icon = icon_phone_qoi;
+        size_t icon_size = sizeof(icon_phone_qoi);
         if (kind == DEVICE_LAPTOP) {
-            icon = icon_laptop_png;
-            icon_size = sizeof(icon_laptop_png);
+            icon = icon_laptop_qoi;
+            icon_size = sizeof(icon_laptop_qoi);
         } else if (kind == DEVICE_TABLET) {
-            icon = icon_tablet_png;
-            icon_size = sizeof(icon_tablet_png);
+            icon = icon_tablet_qoi;
+            icon_size = sizeof(icon_tablet_qoi);
         } else if (kind == DEVICE_WATCH) {
-            icon = icon_watch_png;
-            icon_size = sizeof(icon_watch_png);
+            icon = icon_watch_qoi;
+            icon_size = sizeof(icon_watch_qoi);
         } else if (kind == DEVICE_CAMERA) {
-            icon = icon_camera_png;
-            icon_size = sizeof(icon_camera_png);
+            icon = icon_camera_qoi;
+            icon_size = sizeof(icon_camera_qoi);
         }
         err = gsp_mifi_device_row_row_set_device_icon_resource(
             ui, row, icon, icon_size);
@@ -1654,7 +1654,8 @@ static void on_event(esp_gsp_handle_t ui, const esp_gsp_event_t *event, void *ct
                     uint8_t slot = state->blocked_hw_count++;
                     copy_text(state->blocked_hw_names[slot],
                               sizeof(state->blocked_hw_names[slot]),
-                              info->name[0] ? info->name : "Client");
+                              info->name[0] ? info->name
+                                            : tr(state, "未知设备", "Unknown"));
                     copy_text(state->blocked_hw_macs[slot],
                               sizeof(state->blocked_hw_macs[slot]), info->mac);
                 }

@@ -39,6 +39,7 @@ static const char *TAG = "mifi_service";
 
 #define MIFI_NVS_NAMESPACE "mifi_cfg"
 #define MIFI_MAX_BLOCKED   16
+#define MIFI_DHCP_LEASES   16
 #define DHCPS_OFFER_DNS    0x02
 #define MIFI_DIAL_RETRY_US (15000000LL)
 
@@ -51,6 +52,14 @@ typedef struct {
     int64_t connect_us;
     uint64_t used_bytes;
 } station_slot_t;
+
+/* Hostname and IP last reported for one MAC's own DHCP lease. */
+typedef struct {
+    bool used;
+    uint8_t mac[6];
+    esp_ip4_addr_t ip;
+    char hostname[32];
+} dhcp_lease_t;
 
 typedef struct {
     SemaphoreHandle_t lock;
@@ -80,6 +89,7 @@ typedef struct {
 
     temperature_sensor_handle_t tsens;
     station_slot_t stations[APP_MIFI_MAX_STATIONS];
+    dhcp_lease_t leases[MIFI_DHCP_LEASES];
     char blocked_macs[MIFI_MAX_BLOCKED][18];
     size_t blocked_count;
 
@@ -790,6 +800,60 @@ static void cdc_device_event_cb(usbh_cdc_device_event_t event,
     }
 }
 
+static dhcp_lease_t *find_dhcp_lease_locked(const uint8_t mac[6])
+{
+    for (int i = 0; i < MIFI_DHCP_LEASES; ++i) {
+        if (s_svc.leases[i].used &&
+            memcmp(s_svc.leases[i].mac, mac, 6) == 0) {
+            return &s_svc.leases[i];
+        }
+    }
+    return NULL;
+}
+
+static bool lease_mac_is_online_locked(const uint8_t mac[6])
+{
+    for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
+        if (s_svc.stations[i].active &&
+            memcmp(s_svc.stations[i].mac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static dhcp_lease_t *alloc_dhcp_lease_locked(const uint8_t mac[6])
+{
+    dhcp_lease_t *lease = find_dhcp_lease_locked(mac);
+    if (lease) {
+        return lease;
+    }
+    for (int i = 0; i < MIFI_DHCP_LEASES; ++i) {
+        if (!s_svc.leases[i].used) {
+            return &s_svc.leases[i];
+        }
+    }
+    for (int i = 0; i < MIFI_DHCP_LEASES; ++i) {
+        if (!lease_mac_is_online_locked(s_svc.leases[i].mac)) {
+            return &s_svc.leases[i];
+        }
+    }
+    return &s_svc.leases[0];
+}
+
+/* The event hostname is already this MAC's lease name. */
+static void remember_dhcp_lease_locked(const ip_event_assigned_ip_to_client_t *e)
+{
+    dhcp_lease_t *lease = alloc_dhcp_lease_locked(e->mac);
+    memset(lease, 0, sizeof(*lease));
+    lease->used = true;
+    memcpy(lease->mac, e->mac, 6);
+    lease->ip = e->ip;
+    if (e->hostname[0]) {
+        snprintf(lease->hostname, sizeof(lease->hostname), "%.31s", e->hostname);
+    }
+}
+
 static void wifi_and_net_event_handler(void *arg, esp_event_base_t base,
                                        int32_t id, void *data)
 {
@@ -804,6 +868,9 @@ static void wifi_and_net_event_handler(void *arg, esp_event_base_t base,
             for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
                 if (!s_svc.stations[i].active ||
                     memcmp(s_svc.stations[i].mac, e->mac, 6) == 0) {
+                    if (!s_svc.stations[i].active) {
+                        memset(&s_svc.stations[i], 0, sizeof(s_svc.stations[i]));
+                    }
                     s_svc.stations[i].active = true;
                     memcpy(s_svc.stations[i].mac, e->mac, 6);
                     s_svc.stations[i].aid = e->aid;
@@ -847,33 +914,7 @@ static void wifi_and_net_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
         const ip_event_assigned_ip_to_client_t *e = data;
         xSemaphoreTake(s_svc.lock, portMAX_DELAY);
-        bool matched = false;
-        for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
-            if (s_svc.stations[i].active &&
-                memcmp(s_svc.stations[i].mac, e->mac, 6) == 0) {
-                s_svc.stations[i].ip = e->ip;
-                if (e->hostname[0]) {
-                    snprintf(s_svc.stations[i].hostname,
-                             sizeof(s_svc.stations[i].hostname), "%.31s",
-                             e->hostname);
-                }
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
-                if (s_svc.stations[i].active && s_svc.stations[i].ip.addr == 0) {
-                    s_svc.stations[i].ip = e->ip;
-                    if (e->hostname[0]) {
-                        snprintf(s_svc.stations[i].hostname,
-                                 sizeof(s_svc.stations[i].hostname), "%.31s",
-                                 e->hostname);
-                    }
-                    break;
-                }
-            }
-        }
+        remember_dhcp_lease_locked(e);
         xSemaphoreGive(s_svc.lock);
     } else if (base == IOT_ETH_EVENT) {
         if (id == IOT_ETH_EVENT_START) {
@@ -940,18 +981,30 @@ static void refresh_stations_snapshot_locked(void)
         app_mifi_station_info_t *dst = &s_svc.telemetry.stations[out_idx++];
         memset(dst, 0, sizeof(*dst));
         format_mac_str(s_svc.stations[i].mac, dst->mac);
-        if (s_svc.stations[i].hostname[0]) {
-            snprintf(dst->name, sizeof(dst->name), "%s",
-                     s_svc.stations[i].hostname);
-        } else {
-            snprintf(dst->name, sizeof(dst->name), "Device-%02X%02X",
-                     s_svc.stations[i].mac[4], s_svc.stations[i].mac[5]);
+        const dhcp_lease_t *lease = find_dhcp_lease_locked(s_svc.stations[i].mac);
+        char lease_name[32];
+        esp_ip4_addr_t lease_ip = {0};
+        lease_name[0] = '\0';
+        if (lease) {
+            lease_ip = lease->ip;
+            if (lease->hostname[0]) {
+                memcpy(lease_name, lease->hostname, sizeof(lease_name));
+                lease_name[sizeof(lease_name) - 1] = '\0';
+            }
         }
-        if (s_svc.stations[i].ip.addr != 0) {
-            snprintf(dst->ip, sizeof(dst->ip), IPSTR,
-                     IP2STR(&s_svc.stations[i].ip));
+        if (lease_name[0]) {
+            snprintf(s_svc.stations[i].hostname,
+                     sizeof(s_svc.stations[i].hostname), "%s", lease_name);
+            snprintf(dst->name, sizeof(dst->name), "%s", lease_name);
         } else {
-            snprintf(dst->ip, sizeof(dst->ip), "192.168.4.%d", 2 + i);
+            s_svc.stations[i].hostname[0] = '\0';
+        }
+        if (lease_ip.addr != 0) {
+            s_svc.stations[i].ip = lease_ip;
+            snprintf(dst->ip, sizeof(dst->ip), IPSTR, IP2STR(&lease_ip));
+        } else {
+            s_svc.stations[i].ip.addr = 0;
+            snprintf(dst->ip, sizeof(dst->ip), "--");
         }
         int64_t sec = (now_us - s_svc.stations[i].connect_us) / 1000000;
         if (sec < 60) {
@@ -1039,6 +1092,124 @@ static void poll_battery_and_temp(void)
             (int16_t)((temp_sum / (float)temp_cnt) + 0.5f);
     }
     xSemaphoreGive(s_svc.lock);
+}
+
+static int sta_list_count(const wifi_sta_list_t *list)
+{
+    if (!list || list->num < 0) {
+        return 0;
+    }
+    if (list->num > ESP_WIFI_MAX_CONN_NUM) {
+        return ESP_WIFI_MAX_CONN_NUM;
+    }
+    return list->num;
+}
+
+static bool mac_in_sta_list(const wifi_sta_list_t *list, int count,
+                            const uint8_t mac[6])
+{
+    for (int i = 0; i < count; ++i) {
+        if (memcmp(list->sta[i].mac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* SoftAP driver list is the source of truth. Query it before taking
+ * s_svc.lock: the Wi-Fi event handler holds the driver lock and then
+ * this lock. */
+static void reconcile_stations_with_driver(void)
+{
+    wifi_sta_list_t live = {0};
+    if (esp_wifi_ap_get_sta_list(&live) != ESP_OK) {
+        return;
+    }
+    const int count = sta_list_count(&live);
+    uint16_t aids[ESP_WIFI_MAX_CONN_NUM] = {0};
+    for (int i = 0; i < count; ++i) {
+        uint16_t aid = 0;
+        if (esp_wifi_ap_get_sta_aid(live.sta[i].mac, &aid) == ESP_OK) {
+            aids[i] = aid;
+        }
+    }
+
+    uint16_t kick[ESP_WIFI_MAX_CONN_NUM] = {0};
+    int kick_count = 0;
+
+    xSemaphoreTake(s_svc.lock, portMAX_DELAY);
+    for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
+        if (!s_svc.stations[i].active ||
+            mac_in_sta_list(&live, count, s_svc.stations[i].mac)) {
+            continue;
+        }
+        char mac_str[18];
+        format_mac_str(s_svc.stations[i].mac, mac_str);
+        char zh_ev[44], en_ev[44];
+        snprintf(zh_ev, sizeof(zh_ev), "热点设备离开 %02X:%02X",
+                 s_svc.stations[i].mac[4], s_svc.stations[i].mac[5]);
+        snprintf(en_ev, sizeof(en_ev), "Client left %02X:%02X",
+                 s_svc.stations[i].mac[4], s_svc.stations[i].mac[5]);
+        push_log_event_locked(zh_ev, en_ev);
+        ESP_LOGI(TAG, "Dropped stale station %s", mac_str);
+        memset(&s_svc.stations[i], 0, sizeof(s_svc.stations[i]));
+    }
+    for (int s = 0; s < count; ++s) {
+        const uint8_t *mac = live.sta[s].mac;
+        if ((mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0) {
+            continue;
+        }
+        char mac_str[18];
+        format_mac_str(mac, mac_str);
+        const bool blocked = is_mac_blocked_locked(mac_str);
+        int slot = -1;
+        int free_slot = -1;
+        for (int i = 0; i < APP_MIFI_MAX_STATIONS; ++i) {
+            if (s_svc.stations[i].active &&
+                memcmp(s_svc.stations[i].mac, mac, 6) == 0) {
+                slot = i;
+                break;
+            }
+            if (free_slot < 0 && !s_svc.stations[i].active) {
+                free_slot = i;
+            }
+        }
+        if (blocked) {
+            if (slot >= 0) {
+                memset(&s_svc.stations[slot], 0, sizeof(s_svc.stations[slot]));
+            }
+            if (aids[s] != 0 && kick_count < ESP_WIFI_MAX_CONN_NUM) {
+                kick[kick_count++] = aids[s];
+            }
+            continue;
+        }
+        if (slot >= 0) {
+            if (aids[s] != 0) {
+                s_svc.stations[slot].aid = aids[s];
+            }
+            continue;
+        }
+        if (free_slot < 0) {
+            continue;
+        }
+        station_slot_t *dst = &s_svc.stations[free_slot];
+        memset(dst, 0, sizeof(*dst));
+        dst->active = true;
+        memcpy(dst->mac, mac, 6);
+        dst->aid = aids[s];
+        dst->connect_us = esp_timer_get_time();
+        char zh_ev[44], en_ev[44];
+        snprintf(zh_ev, sizeof(zh_ev), "热点设备接入 %02X:%02X", mac[4], mac[5]);
+        snprintf(en_ev, sizeof(en_ev), "Client joined %02X:%02X", mac[4], mac[5]);
+        push_log_event_locked(zh_ev, en_ev);
+        ESP_LOGI(TAG, "Station reconciled from driver: %s (AID=%u)",
+                 mac_str, (unsigned)aids[s]);
+    }
+    xSemaphoreGive(s_svc.lock);
+
+    for (int i = 0; i < kick_count; ++i) {
+        esp_wifi_deauth_sta(kick[i]);
+    }
 }
 
 static void service_worker_task(void *arg)
@@ -1163,6 +1334,8 @@ static void service_worker_task(void *arg)
         if ((tick % 2) == 0) {
             poll_battery_and_temp();
         }
+
+        reconcile_stations_with_driver();
 
         uint32_t rx_delta = atomic_exchange(&s_svc.rx_bytes_accum, 0);
         uint32_t tx_delta = atomic_exchange(&s_svc.tx_bytes_accum, 0);
